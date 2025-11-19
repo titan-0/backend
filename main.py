@@ -135,6 +135,8 @@ async def positions_json(
 
 @app.get("/internal_order")
 async def internal_order(
+    strategy_id: Optional[str] = Query(None),
+    order_id: Optional[str] = Query(None),
     broker: Optional[str] = Query(None),
     client_id: Optional[str] = Query(None),
     ticker: Optional[str] = Query(None),
@@ -152,6 +154,13 @@ async def internal_order(
     if open_only:
         conditions.append(InternalOrder.quantity_filled - InternalOrder.quantity_exited != 0)
     
+    if strategy_id:
+        conditions.append(InternalOrder.strategy_id.ilike(f"%{strategy_id}%"))
+    if order_id:
+        try:
+            conditions.append(InternalOrder.order_id == int(order_id))
+        except (ValueError, TypeError):
+            pass  # Skip if order_id is not a valid integer
     if broker:
         conditions.append(InternalOrder.broker == broker)
     if client_id:
@@ -178,7 +187,7 @@ async def internal_order(
     
     query = (
         query_builder
-        .order_by(InternalOrder.order_id.desc())
+        .order_by(InternalOrder.last_updated.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -195,26 +204,27 @@ async def internal_order(
     out = []
     for p in rows:
         out.append({
+            "strategy_id": p.strategy_id,
             "order_id": int(p.order_id),
-            "ticker": p.ticker,
             "client_id": p.client_id,
-            "broker": p.broker,
-            "brokeraccount": p.brokeraccount,
+            "ticker": p.ticker,
             "product": p.product,
-            "action": p.action,
             "quantity": int(p.quantity) if p.quantity else 0,
             "price": to_float(p.price),
-            "stoploss_price": to_float(p.stoploss_price),
+            "trigger_price": to_float(p.trigger_price),
             "takeprofit_price": to_float(p.takeprofit_price),
-            "equity": to_float(p.equity),
+            "stoploss_price": to_float(p.stoploss_price),
+            "action": p.action,
+            "last_updated": to_datetime_str(p.last_updated_date),
             "quantity_filled": int(p.quantity_filled) if p.quantity_filled else 0,
             "quantity_exited": int(p.quantity_exited) if p.quantity_exited else 0,
-            "ordertime": to_datetime_str(p.ordertime),
-            "date_entrylast": to_datetime_str(p.date_entrylast),
-            "date_exit": to_datetime_str(p.date_exit),
             "entry_status": p.entry_status,
             "exit_status": p.exit_status,
-            "strategy_id": p.strategy_id,
+            "remarks": p.remarks,
+            "ordertime": to_datetime_str(p.ordertime),
+            "lotsize": int(p.lotsize) if p.lotsize else None,
+            "equity": to_float(p.equity),
+            "signal": int(p.signal_id) if p.signal_id else None
         })
 
     return {
@@ -230,6 +240,8 @@ async def internal_order(
 
 @app.get("/broker_order")
 async def broker_order(
+    id: Optional[int] = Query(None),
+    order_id: Optional[str] = Query(None),
     broker: Optional[str] = Query(None),
     client_id: Optional[str] = Query(None),
     ticker: Optional[str] = Query(None),
@@ -240,9 +252,12 @@ async def broker_order(
     db: AsyncSession = Depends(get_db)
 ):
     
-    
     conditions = []
     
+    if id:
+        conditions.append(BrokerOrder.id == id)
+    if order_id:
+        conditions.append(BrokerOrder.order_id.ilike(f"%{order_id}%"))
     if broker:
         conditions.append(BrokerOrder.broker == broker)
     if client_id:
@@ -267,7 +282,7 @@ async def broker_order(
     
     query = (
         query_builder
-        .order_by(BrokerOrder.order_timestamp.desc())
+        .order_by(BrokerOrder.exchange_timestamp.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -286,28 +301,22 @@ async def broker_order(
         out.append({
             "id": p.id,
             "order_id": p.order_id,
-            "tradingsymbol": p.tradingsymbol,
             "client_id": p.client_id,
+            "tradingsymbol": p.tradingsymbol,
+            "order_timestamp": to_datetime_str(p.order_timestamp),
+            "exchange": p.exchange,
+            "order_type": p.order_type,
+            "quantity": int(p.quantity) if p.quantity else 0,
+            "price": to_float(p.price),
+            "trigger_price": to_float(p.trigger_price),
+            "product": p.product,
             "broker": p.broker,
             "brokeraccount": p.brokeraccount,
-            "product": p.product,
-            "transaction_type": p.transaction_type,
-            "quantity": int(p.quantity) if p.quantity else 0,
-            "filled_quantity": int(p.filled_quantity) if p.filled_quantity else 0,
-            "pending_quantity": int(p.pending_quantity) if p.pending_quantity else 0,
-            "price": to_float(p.price),
-            "average_price": to_float(p.average_price),
-            "trigger_price": to_float(p.trigger_price),
             "status": p.status,
+            "filled_quantity": int(p.filled_quantity) if p.filled_quantity else 0,
+            "average_price": to_float(p.average_price),
             "status_message": p.status_message,
-            "order_type": p.order_type,
-            "validity": p.validity,
-            "variety": p.variety,
-            "exchange": p.exchange,
-            "exchange_order_id": p.exchange_order_id,
-            "order_timestamp": to_datetime_str(p.order_timestamp),
-            "exchange_timestamp": to_datetime_str(p.exchange_timestamp),
-            "tag": int(p.tag) if p.tag else None,
+            "exchange_timestamp":to_datetime_str(p.exchange_timestamp)
         })
 
     return {
@@ -323,6 +332,7 @@ async def broker_order(
 
 @app.get("/trades")
 async def trades(
+    trade_id: Optional[int] = Query(None),
     broker: Optional[str] = Query(None),
     client_id: Optional[str] = Query(None),
     ticker: Optional[str] = Query(None),
@@ -336,6 +346,8 @@ async def trades(
     
     conditions = []
     
+    if trade_id:
+        conditions.append(Trade.id == trade_id)
     if broker:
         conditions.append(Trade.broker == broker)
     if client_id:
@@ -405,10 +417,6 @@ async def trades(
             "broker_order_id": int(p.broker_order_id) if p.broker_order_id else None,
             "broker_trade_id": int(p.broker_trade_id) if p.broker_trade_id else None,
             "internalorder_id": int(p.internalorder_id) if p.internalorder_id else None,
-            "total_charges": round(total_charges, 2),
-            "brokerage_charge": to_float(p.brokerage_charge),
-            "gst_charge": to_float(p.gst_charge),
-            "stt_charge": to_float(p.stt_charge),
         })
 
     return {
