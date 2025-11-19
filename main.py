@@ -2,10 +2,10 @@ from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select,func
 
 from database import get_db, engine, Base
-from models import Order, BrokerConfig
+from models import Order, BrokerConfig,InternalOrder,BrokerOrder,Trade
 
 app = FastAPI(title="Positions Readonly API")
 
@@ -23,7 +23,7 @@ app.add_middleware(
 async def root():
     return {
         "service": "positions-api",
-        "endpoints": ["/health", "/positions_json", "/aliases"],
+        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades"],
         "pagination": {"params": ["page", "limit"], "defaults": {"page": 1, "limit": 20}},
         "filters": ["broker", "client_id", "ticker", "product", "action", "account"],
     }
@@ -35,8 +35,15 @@ async def health():
 
 @app.on_event("startup")
 async def startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        print("Starting database initialization...")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("✓ Database tables created successfully")
+    except Exception as e:
+        print(f"✗ Error creating tables: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @app.get("/positions_json")
@@ -47,13 +54,16 @@ async def positions_json(
     product: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
     account: Optional[str] = Query(None),
+    open_only: bool = Query(False, description="Show only open positions"),
 
     page: int = Query(1, ge=1),
-    limit: int = Query(20, ge=1, le=20),
+    limit: int = Query(20, ge=1, le=100),
 
     db: AsyncSession = Depends(get_db)
 ):
-    conditions = [(Order.quantity_filled - Order.quantity_exited != 0)]
+    conditions = []
+    if open_only:
+        conditions.append(Order.quantity_filled - Order.quantity_exited != 0)
     if broker:
         conditions.append(Order.broker == broker)
     if client_id:
@@ -67,12 +77,20 @@ async def positions_json(
     if account:
         conditions.append(Order.brokeraccount == account)
 
-    offset = (page - 1) * limit
+    # Count total records
+    count_query = select(func.count()).select_from(Order).where(*conditions) if conditions else select(func.count()).select_from(Order)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
 
+    # Fetch paginated data
+    offset = (page - 1) * limit
+    query_builder = select(Order)
+    if conditions:
+        query_builder = query_builder.where(*conditions)
+    
     query = (
-        select(Order)
-        .where(*conditions)
-        .order_by(Order.order_id)
+        query_builder
+        .order_by(Order.order_id.desc())
         .limit(limit)
         .offset(offset)
     )
@@ -112,6 +130,298 @@ async def positions_json(
         })
 
     return out
+
+
+
+@app.get("/internal_order")
+async def internal_order(
+    broker: Optional[str] = Query(None),
+    client_id: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None),
+    product: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    account: Optional[str] = Query(None),
+    open_only: bool = Query(False),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    
+    # Build conditions
+    conditions = []
+    if open_only:
+        conditions.append(InternalOrder.quantity_filled - InternalOrder.quantity_exited != 0)
+    
+    if broker:
+        conditions.append(InternalOrder.broker == broker)
+    if client_id:
+        conditions.append(InternalOrder.client_id == client_id)
+    if ticker:
+        conditions.append(InternalOrder.ticker == ticker)
+    if product:
+        conditions.append(InternalOrder.product == product)
+    if action:
+        conditions.append(InternalOrder.action == action)
+    if account:
+        conditions.append(InternalOrder.brokeraccount == int(account))
+
+    # Count total records
+    count_query = select(func.count()).select_from(InternalOrder).where(*conditions) if conditions else select(func.count()).select_from(InternalOrder)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Fetch paginated data
+    offset = (page - 1) * limit
+    query_builder = select(InternalOrder)
+    if conditions:
+        query_builder = query_builder.where(*conditions)
+    
+    query = (
+        query_builder
+        .order_by(InternalOrder.order_id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    def to_float(v):
+        return float(v) if v is not None else None
+
+    def to_datetime_str(d):
+        return d.isoformat() if d is not None else None
+
+    out = []
+    for p in rows:
+        out.append({
+            "order_id": int(p.order_id),
+            "ticker": p.ticker,
+            "client_id": p.client_id,
+            "broker": p.broker,
+            "brokeraccount": p.brokeraccount,
+            "product": p.product,
+            "action": p.action,
+            "quantity": int(p.quantity) if p.quantity else 0,
+            "price": to_float(p.price),
+            "stoploss_price": to_float(p.stoploss_price),
+            "takeprofit_price": to_float(p.takeprofit_price),
+            "equity": to_float(p.equity),
+            "quantity_filled": int(p.quantity_filled) if p.quantity_filled else 0,
+            "quantity_exited": int(p.quantity_exited) if p.quantity_exited else 0,
+            "ordertime": to_datetime_str(p.ordertime),
+            "date_entrylast": to_datetime_str(p.date_entrylast),
+            "date_exit": to_datetime_str(p.date_exit),
+            "entry_status": p.entry_status,
+            "exit_status": p.exit_status,
+            "strategy_id": p.strategy_id,
+        })
+
+    return {
+        "data": out,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+@app.get("/broker_order")
+async def broker_order(
+    broker: Optional[str] = Query(None),
+    client_id: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    account: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+    
+    
+    conditions = []
+    
+    if broker:
+        conditions.append(BrokerOrder.broker == broker)
+    if client_id:
+        conditions.append(BrokerOrder.client_id == client_id)
+    if ticker:
+        conditions.append(BrokerOrder.tradingsymbol.ilike(f"%{ticker}%"))
+    if status:
+        conditions.append(BrokerOrder.status == status)
+    if account:
+        conditions.append(BrokerOrder.brokeraccount == int(account))
+
+    # Count total records
+    count_query = select(func.count()).select_from(BrokerOrder).where(*conditions) if conditions else select(func.count()).select_from(BrokerOrder)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Fetch paginated data
+    offset = (page - 1) * limit
+    query_builder = select(BrokerOrder)
+    if conditions:
+        query_builder = query_builder.where(*conditions)
+    
+    query = (
+        query_builder
+        .order_by(BrokerOrder.order_timestamp.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    def to_float(v):
+        return float(v) if v is not None else None
+
+    def to_datetime_str(d):
+        return d.isoformat() if d is not None else None
+
+    out = []
+    for p in rows:
+        out.append({
+            "id": p.id,
+            "order_id": p.order_id,
+            "tradingsymbol": p.tradingsymbol,
+            "client_id": p.client_id,
+            "broker": p.broker,
+            "brokeraccount": p.brokeraccount,
+            "product": p.product,
+            "transaction_type": p.transaction_type,
+            "quantity": int(p.quantity) if p.quantity else 0,
+            "filled_quantity": int(p.filled_quantity) if p.filled_quantity else 0,
+            "pending_quantity": int(p.pending_quantity) if p.pending_quantity else 0,
+            "price": to_float(p.price),
+            "average_price": to_float(p.average_price),
+            "trigger_price": to_float(p.trigger_price),
+            "status": p.status,
+            "status_message": p.status_message,
+            "order_type": p.order_type,
+            "validity": p.validity,
+            "variety": p.variety,
+            "exchange": p.exchange,
+            "exchange_order_id": p.exchange_order_id,
+            "order_timestamp": to_datetime_str(p.order_timestamp),
+            "exchange_timestamp": to_datetime_str(p.exchange_timestamp),
+            "tag": int(p.tag) if p.tag else None,
+        })
+
+    return {
+        "data": out,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
+@app.get("/trades")
+async def trades(
+    broker: Optional[str] = Query(None),
+    client_id: Optional[str] = Query(None),
+    ticker: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    account: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db)
+):
+   
+    
+    conditions = []
+    
+    if broker:
+        conditions.append(Trade.broker == broker)
+    if client_id:
+        conditions.append(Trade.client_id == client_id)
+    if ticker:
+        conditions.append(Trade.ticker.ilike(f"%{ticker}%"))
+    if action:
+        conditions.append(Trade.action == action)
+    if account:
+        conditions.append(Trade.brokeraccount == int(account))
+
+    # Count total records
+    count_query = select(func.count()).select_from(Trade).where(*conditions) if conditions else select(func.count()).select_from(Trade)
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Fetch paginated data
+    offset = (page - 1) * limit
+    query_builder = select(Trade)
+    if conditions:
+        query_builder = query_builder.where(*conditions)
+    
+    query = (
+        query_builder
+        .order_by(Trade.exchange_timestamp.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    def to_float(v):
+        return float(v) if v is not None else None
+
+    def to_datetime_str(d):
+        return d.isoformat() if d is not None else None
+
+    out = []
+    for p in rows:
+        total_charges = sum([
+            to_float(p.brokerage_charge) or 0,
+            to_float(p.exchange_charge) or 0,
+            to_float(p.gst_charge) or 0,
+            to_float(p.stt_charge) or 0,
+            to_float(p.stampduty_charge) or 0,
+            to_float(p.sebi_charge) or 0,
+            to_float(p.other_charge) or 0,
+            to_float(p.clearing_charge) or 0,
+            to_float(p.brokerage_fix_charge) or 0,
+            to_float(p.fixed_charges_other) or 0,
+        ])
+        
+        out.append({
+            "trade_id": p.trade_primarykey_id,
+            "ticker": p.ticker,
+            "client_id": p.client_id,
+            "broker": p.broker,
+            "brokeraccount": p.brokeraccount,
+            "product": p.product,
+            "action": p.action,
+            "quantity": int(p.quantity) if p.quantity else 0,
+            "price": to_float(p.price),
+            "exchange": p.exchange,
+            "exchange_timestamp": to_datetime_str(p.exchange_timestamp),
+            "exchange_order_id": int(p.exchange_order_id) if p.exchange_order_id else None,
+            "broker_order_id": int(p.broker_order_id) if p.broker_order_id else None,
+            "broker_trade_id": int(p.broker_trade_id) if p.broker_trade_id else None,
+            "internalorder_id": int(p.internalorder_id) if p.internalorder_id else None,
+            "total_charges": round(total_charges, 2),
+            "brokerage_charge": to_float(p.brokerage_charge),
+            "gst_charge": to_float(p.gst_charge),
+            "stt_charge": to_float(p.stt_charge),
+        })
+
+    return {
+        "data": out,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "pages": (total + limit - 1) // limit
+        }
+    }
+
+
 
 
 @app.get("/aliases")
