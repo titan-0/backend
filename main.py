@@ -6,6 +6,7 @@ from sqlalchemy import select,func
 
 from database import get_db, engine, Base
 from models import Order, BrokerConfig,InternalOrder,BrokerOrder,Trade
+from auth import LoginRequest, TokenResponse, create_access_token, verify_token
 
 app = FastAPI(title="Positions Readonly API")
 
@@ -23,7 +24,7 @@ app.add_middleware(
 async def root():
     return {
         "service": "positions-api",
-        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades"],
+        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades","/api/login"],
         "pagination": {"params": ["page", "limit"], "defaults": {"page": 1, "limit": 20}},
         "filters": ["broker", "client_id", "ticker", "product", "action", "account"],
     }
@@ -32,6 +33,25 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.post("/api/login")
+async def login(credentials: LoginRequest):
+    """
+    Simple login endpoint for testing.
+    In production, validate against a real user database.
+    """
+    # For demo purposes, accept any email and password
+    # In production, validate against actual credentials in database
+    email = credentials.email
+    
+    # Create JWT token
+    token = create_access_token(email)
+    
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user={"email": email}
+    )
 
 @app.on_event("startup")
 async def startup():

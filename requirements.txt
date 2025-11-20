@@ -3,3 +3,6 @@ sqlalchemy[asyncio]
 fastapi
 uvicorn
 asyncpg
+pydantic
+pyjwt
+python-dotenv
