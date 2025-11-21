@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Boolean, Numeric, Date, BigInteger,Enum,DateTime,func,ForeignKey,Index
+from sqlalchemy import Column, String, Integer, Boolean, Numeric, Date, BigInteger, Enum, DateTime, func, ForeignKey, Index, Text
 from database import Base
 from sqlalchemy.orm import relationship
 
@@ -37,8 +37,9 @@ class InternalOrder(Base):
 
     order_id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    ordertime = Column(DateTime(timezone=False), default=func.now())
-    last_updated = Column(DateTime(timezone=False), default=func.now(), onupdate=func.now())
+    # CHANGE: Remove timezone=False for MySQL (MySQL DATETIME doesn't have timezone)
+    ordertime = Column(DateTime, default=func.now())
+    last_updated = Column(DateTime, default=func.now(), onupdate=func.now())
 
     ordertype = Column(String(32), nullable=False)
     ticker = Column(String(64), nullable=False)
@@ -148,12 +149,13 @@ class BrokerOrder(Base):
     disclosed_quantity = Column(Integer)
     exchange = Column(String(8), nullable=False)
     exchange_order_id = Column(String(50))
-    exchange_timestamp = Column(DateTime(timezone=False), default=func.now())
-    exchange_update_timestamp = Column(DateTime(timezone=False), default=func.now())
+    # CHANGE: Remove timezone=False
+    exchange_timestamp = Column(DateTime, default=func.now())
+    exchange_update_timestamp = Column(DateTime, default=func.now())
     filled_quantity = Column(Integer)
     instrument_token = Column(BigInteger)
     order_id = Column(String(20))
-    order_timestamp = Column(DateTime(timezone=False), default=func.now())
+    order_timestamp = Column(DateTime, default=func.now())
     order_type = Column(String(10))
     parent_order_id = Column(String(20))
     pending_quantity = Column(Integer)
@@ -162,7 +164,8 @@ class BrokerOrder(Base):
     product = Column(String(10))
     quantity = Column(Integer)
     status = Column(String(16))
-    status_message = Column(String(64))
+    # CHANGE: Increase status_message length for MySQL (String(255) is safer)
+    status_message = Column(String(255))
     tag = Column(BigInteger)
     tradingsymbol = Column(String(64))
     transaction_type = Column(String(6))
@@ -186,7 +189,6 @@ class BrokerOrder(Base):
     client_id = Column(String(10))
     brokeraccount = Column(Integer)
 
-    # Cannot auto-generate SQL computed columns in PostgreSQL easily → store as real column
     orderdate = Column(Date)
 
 
@@ -200,7 +202,8 @@ class Trade(Base):
     __tablename__ = "trade"
 
     trade_primarykey_id = Column(Integer, primary_key=True, autoincrement=True)
-    exchange_timestamp = Column(DateTime(timezone=False), nullable=False)
+    # CHANGE: Remove timezone=False
+    exchange_timestamp = Column(DateTime, nullable=False)
     ticker = Column(String(64), nullable=False)
     exchange = Column(String(8), nullable=False)
 
@@ -245,6 +248,4 @@ class Trade(Base):
     brokerage_fix_charge = Column(Numeric(10, 4), default=0)
     fixed_charges_other = Column(Numeric(10, 4), default=0)
 
-    # Not using virtual date column in PostgreSQL, store directly
     exchange_timestamp_date = Column(Date)
-

@@ -6,3 +6,6 @@ asyncpg
 pydantic
 pyjwt
 python-dotenv
+ aiomysql 
+ pymysql 
+ cryptography
