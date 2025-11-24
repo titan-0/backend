@@ -1,7 +1,13 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
+import os
 
-DATABASE_URL = "mysql+aiomysql://root:harshal123@127.0.0.1:3307/deccan"
+# Use host.docker.internal to connect to host machine's MySQL from Docker
+# Falls back to localhost for local development
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = os.getenv("DB_PORT", "3307")
+DATABASE_URL = f"mysql+aiomysql://root:harshal123@{DB_HOST}:{DB_PORT}/deccan"
+
 
 engine = create_async_engine(
     DATABASE_URL, 

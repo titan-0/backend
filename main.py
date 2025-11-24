@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select,func
+from pydantic import BaseModel
+from datetime import datetime, date
 
 from database import get_db, engine, Base
 from models import Order, BrokerConfig,InternalOrder,BrokerOrder,Trade
@@ -13,8 +15,8 @@ app = FastAPI(title="Positions Readonly API")
 # CORS for local frontend dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -24,7 +26,7 @@ app.add_middleware(
 async def root():
     return {
         "service": "positions-api",
-        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades","/api/login"],
+        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades","/login"],
         "pagination": {"params": ["page", "limit"], "defaults": {"page": 1, "limit": 20}},
         "filters": ["broker", "client_id", "ticker", "product", "action", "account"],
     }
@@ -34,7 +36,7 @@ async def root():
 async def health():
     return {"status": "ok"}
 
-@app.post("/api/login")
+@app.post("/login")
 async def login(credentials: LoginRequest):
     """
     Simple login endpoint for testing.
@@ -457,3 +459,102 @@ async def aliases(db: AsyncSession = Depends(get_db)):
     # Return list of alias strings directly from DB
     result = await db.execute(select(BrokerConfig.alias))
     return [row[0] for row in result.all()]
+
+
+# Pydantic model for new order request
+class NewOrderRequest(BaseModel):
+    alias: str
+    ticker: str
+    action: str  # "BUY" or "SELL"
+    quantity: int
+    ordertype: str  # e.g., "PositionalOrder"
+    price: Optional[float] = 0
+    trigger_price: Optional[float] = 0
+    stoploss_price: Optional[float] = 0
+    stoploss_trigger_price: Optional[float] = 0
+    takeprofit_price: Optional[float] = 0
+    product: Optional[str] = "MIS"  # MIS, NRML, CNC
+    exchange: Optional[str] = None
+    validity: Optional[str] = "DAY"
+    ordertype_base: Optional[str] = "LIMIT"
+
+
+@app.post("/place_order")
+async def place_order(order: NewOrderRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Create a new order and insert into internalorder table
+    """
+    try:
+        # Validate required fields
+        if not order.alias or not order.alias.strip():
+            raise HTTPException(status_code=400, detail="Alias is required")
+        
+        if not order.ticker or not order.ticker.strip():
+            raise HTTPException(status_code=400, detail="Ticker is required")
+        
+        if order.quantity <= 0:
+            raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+        
+        if order.action.upper() not in ["BUY", "SELL"]:
+            raise HTTPException(status_code=400, detail="Action must be either BUY or SELL")
+        
+        # Get broker info from alias
+        broker_result = await db.execute(
+            select(BrokerConfig).where(BrokerConfig.alias == order.alias)
+        )
+        broker_config = broker_result.scalar_one_or_none()
+        
+        if not broker_config:
+            raise HTTPException(status_code=404, detail=f"Alias '{order.alias}' not found")
+        
+        # Validate product
+        valid_products = ["MIS", "NRML", "CNC"]
+        product = order.product.upper() if order.product else "MIS"
+        if product not in valid_products:
+            raise HTTPException(status_code=400, detail=f"Product must be one of {valid_products}")
+        
+        # Create new internal order
+        new_order = InternalOrder(
+            ordertype=order.ordertype,
+            ticker=order.ticker.upper(),
+            quantity=order.quantity,
+            action=order.action.upper(),
+            price=order.price or 0,
+            trigger_price=order.trigger_price or 0,
+            stoploss_price=order.stoploss_price or 0,
+            stoploss_trigger_price=order.stoploss_trigger_price or 0,
+            takeprofit_price=order.takeprofit_price or 0,
+            broker=broker_config.broker,
+            client_id=broker_config.client_id,
+            product=product,
+            validity=order.validity.upper() if order.validity else "DAY",
+            ordertype_base=order.ordertype_base.upper() if order.ordertype_base else "LIMIT",
+            entrysingal_source="WEB",
+            entry_status="PENDING",
+            order_date=date.today(),
+            lotsize=1,
+            ticksize=0.05,
+        )
+        
+        db.add(new_order)
+        await db.commit()
+        await db.refresh(new_order)
+        
+        return {
+            "status": "success",
+            "message": "Order placed successfully",
+            "order_id": new_order.order_id,
+            "ticker": new_order.ticker,
+            "action": new_order.action,
+            "quantity": new_order.quantity,
+            "broker": new_order.broker,
+        }
+    
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Rollback on any error
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to place order: {str(e)}")
+
