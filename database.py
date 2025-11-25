@@ -4,9 +4,12 @@ import os
 
 # Use host.docker.internal to connect to host machine's MySQL from Docker
 # Falls back to localhost for local development
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = os.getenv("DB_PORT", "3307")
-DATABASE_URL = f"mysql+aiomysql://root:harshal123@{DB_HOST}:{DB_PORT}/deccan"
+# DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+# DB_PORT = os.getenv("DB_PORT", "3307")
+# DATABASE_URL = f"mysql+aiomysql://root:harshal123@{DB_HOST}:{DB_PORT}/deccan"
+
+DB_HOST = os.getenv("DB_HOST", "host.docker.internal")
+DATABASE_URL = f"mysql+aiomysql://root:Deccan115@{DB_HOST}:3306/tradingdatabase"
 
 
 engine = create_async_engine(

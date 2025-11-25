@@ -531,7 +531,6 @@ async def place_order(order: NewOrderRequest, db: AsyncSession = Depends(get_db)
             ordertype_base=order.ordertype_base.upper() if order.ordertype_base else "LIMIT",
             entrysingal_source="WEB",
             entry_status="PENDING",
-            order_date=date.today(),
             lotsize=1,
             ticksize=0.05,
         )
