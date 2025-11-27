@@ -6,6 +6,11 @@ asyncpg
 pydantic
 pyjwt
 python-dotenv
- aiomysql 
- pymysql 
- cryptography
+aiomysql 
+pymysql 
+cryptography
+celery
+pika
+msgpack
+redis
+aio_pika

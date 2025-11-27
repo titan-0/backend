@@ -8,7 +8,7 @@ import os
 # DB_PORT = os.getenv("DB_PORT", "3307")
 # DATABASE_URL = f"mysql+aiomysql://root:harshal123@{DB_HOST}:{DB_PORT}/deccan"
 
-DB_HOST = os.getenv("DB_HOST", "host.docker.internal")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DATABASE_URL = f"mysql+aiomysql://root:Deccan115@{DB_HOST}:3306/tradingdatabase"
 
 

@@ -1,16 +1,123 @@
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select,func
 from pydantic import BaseModel
 from datetime import datetime, date
+import datetime
+import threading
+import subprocess
+import sys
+import signal
+import atexit
+import aio_pika
 
-from database import get_db, engine, Base
+from database import get_db, engine, Base, AsyncSessionLocal
 from models import Order, BrokerConfig,InternalOrder,BrokerOrder,Trade
 from auth import LoginRequest, TokenResponse, create_access_token, verify_token
+import deccan_execution_handler.events as eventk
+from deccan_execution_handler.price_parser import PriceParser
+from deccan_execution_handler.message_pack import MsgpackKanhoji
 
 app = FastAPI(title="Positions Readonly API")
+
+RABBITMQ_URL = "amqp://deccan:Deccan115@127.0.0.1:5672/"
+OMS_QUEUE = "kanhoji.to.orderbook_handler_worker.1"
+EXCHANGE_NAME = "kanhoji_worker"
+
+broker_configs = {}  # alias → broker config mapping
+
+# Background processes
+worker_process = None
+consumer_thread = None
+shutdown_flag = threading.Event()
+
+async def load_broker_configs():
+    """Load broker configurations into memory on startup."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(BrokerConfig))
+        rows = result.scalars().all()
+        for row in rows:
+            broker_configs[row.alias] = {
+                "broker": row.broker,
+                "client_id": row.client_id,
+                "broker_account": row.broker_account,
+            }
+    print(f"✅ Loaded {len(broker_configs)} broker configs")
+
+def cleanup_processes():
+    """Cleanup all background processes"""
+    global worker_process, consumer_thread
+    
+    print("🧹 Cleaning up background processes...")
+    
+    # Terminate Celery worker
+    if worker_process and worker_process.poll() is None:
+        print("⏹️ Stopping Celery worker...")
+        worker_process.terminate()
+        try:
+            worker_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            worker_process.kill()
+    
+    # Signal consumer thread to stop
+    shutdown_flag.set()
+    
+    print("✅ Cleanup complete")
+
+# Register cleanup on exit
+atexit.register(cleanup_processes)
+
+def start_celery_worker():
+    """Start Celery worker as subprocess"""
+    global worker_process
+    worker_process = subprocess.Popen([
+        sys.executable, "-m", "celery",
+        "-A", "celery_app", "worker",
+        "--loglevel=info",
+        "--pool=solo",
+        "--queues=celery_tasks"
+    ])
+
+def start_rabbitmq_consumer():
+    """Start RabbitMQ consumer in background thread"""
+    from celery_middleware import main as consumer_main
+    try:
+        consumer_main()
+    except Exception as e:
+        if not shutdown_flag.is_set():
+            print(f"❌ Consumer error: {e}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Start Celery worker and RabbitMQ consumer on app startup"""
+    global worker_process, consumer_thread
+    
+    print("🚀 Starting Celery worker...")
+    start_celery_worker()
+    
+    print("🚀 Starting RabbitMQ consumer...")
+    consumer_thread = threading.Thread(target=start_rabbitmq_consumer, daemon=False)
+    consumer_thread.start()
+    
+    print("✅ All background services started")
+   
+
+@app.on_event("startup")
+async def startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    # Load broker configs into memory
+    await load_broker_configs()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    print("🛑 Shutting down background services...")
+    cleanup_processes()
 
 # CORS for local frontend dev
 app.add_middleware(
@@ -26,7 +133,7 @@ app.add_middleware(
 async def root():
     return {
         "service": "positions-api",
-        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades","/login"],
+        "endpoints": ["/health", "/positions_json", "/aliases","/internal_order","/broker_order","/trades","/login","/place_order"],
         "pagination": {"params": ["page", "limit"], "defaults": {"page": 1, "limit": 20}},
         "filters": ["broker", "client_id", "ticker", "product", "action", "account"],
     }
@@ -35,6 +142,8 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
 
 @app.post("/login")
 async def login(credentials: LoginRequest):
@@ -480,80 +589,121 @@ class NewOrderRequest(BaseModel):
 
 
 @app.post("/place_order")
-async def place_order(order: NewOrderRequest, db: AsyncSession = Depends(get_db)):
-    """
-    Create a new order and insert into internalorder table
-    """
-    try:
-        # Validate required fields
-        if not order.alias or not order.alias.strip():
-            raise HTTPException(status_code=400, detail="Alias is required")
-        
-        if not order.ticker or not order.ticker.strip():
-            raise HTTPException(status_code=400, detail="Ticker is required")
-        
-        if order.quantity <= 0:
-            raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
-        
-        if order.action.upper() not in ["BUY", "SELL"]:
-            raise HTTPException(status_code=400, detail="Action must be either BUY or SELL")
-        
-        # Get broker info from alias
-        broker_result = await db.execute(
-            select(BrokerConfig).where(BrokerConfig.alias == order.alias)
-        )
-        broker_config = broker_result.scalar_one_or_none()
-        
-        if not broker_config:
-            raise HTTPException(status_code=404, detail=f"Alias '{order.alias}' not found")
-        
-        # Validate product
-        valid_products = ["MIS", "NRML", "CNC"]
-        product = order.product.upper() if order.product else "MIS"
-        if product not in valid_products:
-            raise HTTPException(status_code=400, detail=f"Product must be one of {valid_products}")
-        
-        # Create new internal order
-        new_order = InternalOrder(
-            ordertype=order.ordertype,
-            ticker=order.ticker.upper(),
-            quantity=order.quantity,
-            action=order.action.upper(),
-            price=order.price or 0,
-            trigger_price=order.trigger_price or 0,
-            stoploss_price=order.stoploss_price or 0,
-            stoploss_trigger_price=order.stoploss_trigger_price or 0,
-            takeprofit_price=order.takeprofit_price or 0,
-            broker=broker_config.broker,
-            client_id=broker_config.client_id,
-            product=product,
-            validity=order.validity.upper() if order.validity else "DAY",
-            ordertype_base=order.ordertype_base.upper() if order.ordertype_base else "LIMIT",
-            entrysingal_source="WEB",
-            entry_status="PENDING",
-            lotsize=1,
-            ticksize=0.05,
-        )
-        
-        db.add(new_order)
-        await db.commit()
-        await db.refresh(new_order)
-        
-        return {
-            "status": "success",
-            "message": "Order placed successfully",
-            "order_id": new_order.order_id,
-            "ticker": new_order.ticker,
-            "action": new_order.action,
-            "quantity": new_order.quantity,
-            "broker": new_order.broker,
-        }
-    
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-    except Exception as e:
-        # Rollback on any error
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to place order: {str(e)}")
+async def place_order(request: Request, db: AsyncSession = Depends(get_db)):
+    data = await request.json()
 
+    # Lookup client_id, broker, brokeraccount based on alias
+    alias = data.get("alias")
+    client_id = broker = brokeraccount = None
+    if alias:
+        query = select(Order).where(Order.client_id == alias).limit(1)
+        result = await db.execute(query)
+        order = result.scalars().first()
+        if order:
+            client_id = order.client_id
+            broker = order.broker
+            brokeraccount = order.brokeraccount
+    broker_info = broker_configs[alias]
+    # Build the signal payload
+    # parse time_in_force into a datetime.time object
+    time_str = data.get("time_in_force", "15:31")
+    try:
+        time_in_force = datetime.datetime.strptime(time_str, "%H:%M").time()
+    except Exception:
+        # fallback to default if parsing fails
+        time_in_force = datetime.datetime.strptime("15:31", "%H:%M").time()
+    if data.get("price") in [None, 0, "0", ""]:
+        data["price"] = None
+    else:
+        data["price"] = PriceParser.parse(float(data["price"]))
+    if data.get("trigger_price") in [None, 0, "0", ""]:
+        data["trigger_price"] = None
+    else:
+        data["trigger_price"] = PriceParser.parse(float(data["trigger_price"]))     
+    if data.get("stoploss_price") in [None, 0, "0", ""]:
+        data["stoploss_price"] = None
+    else:
+        data["stoploss_price"] = PriceParser.parse(float(data["stoploss_price"]))
+    if data.get("stoploss_trigger_price") in [None, 0, "0", ""]:
+        data["stoploss_trigger_price"] = None
+    else:
+        data["stoploss_trigger_price"] = PriceParser.parse(float(data["stoploss_trigger_price"]))   
+    if data.get("takeprofit_price") in [None, 0, "0", ""]:
+        data["takeprofit_price"] = None
+    else:
+        data["takeprofit_price"] = PriceParser.parse(float(data["takeprofit_price"]))
+    payload = {
+        "signal_id": int(datetime.datetime.now().timestamp() * 1000),
+        "exchange": data.get("exchange","NFO"),
+        "type": "SIGNAL",
+        "signaltype": "NEW_ENTRY",
+        "ticker": data.get("ticker"),
+        "quantity": int(data.get("quantity", 0)),
+        "action": data.get("action"),
+        "broker": broker_info.get("broker") or data.get("broker"),
+        "client_id": broker_info.get("client_id") or data.get("client_id"),
+        "brokeraccount": broker_info.get("broker_account") or data.get("brokeraccount"),
+        "price": data.get("price", 0),
+        "trigger_price": data.get("trigger_price", 0),
+        "stoploss_price": data.get("stoploss_price", 0),
+        "stoploss_trigger_price": data.get("stoploss_trigger_price", 0),
+        "takeprofit_price": data.get("takeprofit_price", 0),
+        "product": data.get("product"),
+        "ordertype": data.get("ordertype"),
+        "strategy_id": "POTN3",
+        "dealer_id": "MANGESH",
+        "currency": "INR",
+        "time_in_force": time_in_force,
+        "variety": "OVERNIGHT",
+        "validity": "DAY",
+        "market": "OPTIONS",
+        "isactive_exit": True,
+        "lotsize": int(data.get("lotsize", 1)),
+        "ticksize": PriceParser.parse(float(data.get("ticksize", 0.05))),
+        "parent_order_id": None,
+        'time_in_force': datetime.time(23, 31),
+        "variety": "OVERNIGHT",
+        "validity": "DAY",
+        'entrysingal_source': 'ALGO', 
+        'exitsignal_source': 'ALGO', 
+        'slippageprice_entry': 0, 
+        'slippageprice_exit': 0, 
+        'orderexit_how': 'ALGO', 
+        'equity': 100000.0,
+        'time_entrystart': datetime.time(9, 15),
+        'date_entrylast': datetime.date(2027, 10, 23),
+        'date_exit': datetime.datetime(2027, 10, 23, 0, 0),
+        'twap_leg_count': 1,
+        'exit_time': datetime.time(16, 0),
+
+    }
+
+    # Send to RabbitMQ
+    try:
+        connection = await aio_pika.connect_robust(RABBITMQ_URL)
+
+        async with connection:
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=1)
+
+            # Declare exchange if not already existing
+            exchange = await channel.declare_exchange(EXCHANGE_NAME, aio_pika.ExchangeType.TOPIC, durable=False)
+
+            # Create the message payload
+            signal_event = eventk.SignalEvent(**payload)
+            packed_data = MsgpackKanhoji.packb(signal_event)
+
+            # Publish to exchange with routing key
+            message = aio_pika.Message(
+                body=packed_data,
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+            )
+
+            await exchange.publish(message, routing_key=OMS_QUEUE)
+            print(f"✅ Message published to exchange '{EXCHANGE_NAME}' with routing '{OMS_QUEUE}'")
+
+
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)})
+
+    return JSONResponse({"status": "success"})
